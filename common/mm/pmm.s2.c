@@ -434,6 +434,54 @@ static void pmm_spare_firmware_stack(void) {
     } while (carved);
 }
 
+static void pmm_reserve_firmware_low_mem(uint64_t count) {
+    uint64_t limit = 0x100000000;
+
+#if !defined(__x86_64__) && !defined(__i386__)
+again:
+#endif
+    for (int i = memmap_entries - 1; i >= 0; i--) {
+        if (memmap[i].type != MEMMAP_USABLE) {
+            continue;
+        }
+
+        uint64_t entry_base = memmap[i].base;
+        uint64_t entry_top = CHECKED_ADD(memmap[i].base, memmap[i].length, continue);
+
+        if (entry_top > limit) {
+            entry_top = limit;
+            if (entry_base >= entry_top) {
+                continue;
+            }
+        }
+
+        if (entry_top - entry_base < count) {
+            continue;
+        }
+
+        uint64_t alloc_base = ALIGN_DOWN(entry_top - count, 4096);
+        if (alloc_base < entry_base) {
+            continue;
+        }
+
+        uint64_t aligned_length = entry_top - alloc_base;
+        memmap_alloc_range(alloc_base, aligned_length, MEMMAP_EFI_RECLAIMABLE,
+                           MEMMAP_USABLE, true, false, false);
+
+        pmm_sanitise_entries(memmap, &memmap_entries, false);
+        return;
+    }
+
+#if !defined(__x86_64__) && !defined(__i386__)
+    if (limit < UINT64_MAX) {
+        limit = UINT64_MAX;
+        goto again;
+    }
+#endif
+
+    panic(false, "Out of memory");
+}
+
 void init_memmap(void) {
     EFI_STATUS status;
 
@@ -543,7 +591,7 @@ void init_memmap(void) {
 
     // Let's leave 64MiB to the firmware below 4GiB
     for (size_t i = 0; i < 64; i++) {
-        ext_mem_alloc_type(0x100000, MEMMAP_EFI_RECLAIMABLE);
+        pmm_reserve_firmware_low_mem(0x100000);
     }
 
     memcpy(untouched_memmap, memmap, memmap_entries * sizeof(struct memmap_entry));
