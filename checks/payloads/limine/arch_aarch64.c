@@ -19,6 +19,16 @@ static int current_el(void) {
     return (READ_SYSREG(CurrentEL) >> 2) & 3;
 }
 
+static inline void set_exception_sp(uint64_t val) {
+    asm volatile (
+        "msr SPSel, #1\n\t"
+        "mov sp, %0\n\t"
+        "msr SPSel, #0"
+        :: "r" (val)
+        : "memory"
+    );
+}
+
 static uint64_t at_phys(uint64_t va) {
     uint64_t par;
     if (current_el() == 2) {
@@ -46,11 +56,25 @@ void arch_init_output(void) {
         int shift = 12 + 9 * (3 - level);
         uint64_t idx = (va >> shift) & (level == -1 ? 0xf : 511);
         tables[t][idx] = at_phys((uint64_t)(uintptr_t)tables[t + 1]) | 3;
+        if (level == 1) {
+            // Map 1GiB block at 0x40_0000_0000 covering highmem PCIe ECAM (0x4010000000)
+            tables[t][256] = (uint64_t)0x4000000000ULL | (2 << 2) | (1 << 10)
+                            | ((uint64_t)3 << 53) | 1;
+        }
         t++;
     }
     // A 2MiB block at level 2: AttrIndx 2, AF, PXN, UXN.
     tables[t][(va >> 21) & 511] = (va & ~(uint64_t)0x1fffff) | (2 << 2) | (1 << 10)
                                  | ((uint64_t)3 << 53) | 1;
+    // Map SBSA GWDT at 0x0f000000 (control frame at 0x0f001000)
+    uint64_t gwdt_va = 0x0f000000;
+    tables[t][(gwdt_va >> 21) & 511] = (gwdt_va & ~(uint64_t)0x1fffff) | (2 << 2) | (1 << 10)
+                                     | ((uint64_t)3 << 53) | 1;
+    // Map low PCIe ECAM at 0x3f000000 - 0x3fffffff (16MiB = 8 x 2MiB blocks)
+    for (int i = 504; i < 512; i++) {
+        uint64_t pa = (uint64_t)i << 21;
+        tables[t][i] = pa | (2 << 2) | (1 << 10) | ((uint64_t)3 << 53) | 1;
+    }
     uint64_t mair = READ_SYSREG(mair_el1);
     mair &= ~((uint64_t)0xff << 16);
     WRITE_SYSREG(mair_el1, mair);
@@ -59,6 +83,16 @@ void arch_init_output(void) {
     WRITE_SYSREG(ttbr0_el1, ttbr0);
     asm volatile ("isb\n\ttlbi vmalle1\n\tdsb ish\n\tisb" ::: "memory");
     uart = (volatile uint32_t *)UART_BASE;
+
+    extern char exception_vector_table[];
+    extern char bsp_exception_stack_top[];
+    set_exception_sp((uint64_t)(uintptr_t)bsp_exception_stack_top);
+    if (current_el() == 2) {
+        WRITE_SYSREG(vbar_el2, (uint64_t)(uintptr_t)exception_vector_table);
+    } else {
+        WRITE_SYSREG(vbar_el1, (uint64_t)(uintptr_t)exception_vector_table);
+    }
+    asm volatile ("isb" ::: "memory");
 }
 
 void arch_out_char(char c) {
@@ -283,7 +317,17 @@ void arch_prepare_aps(void) {
 }
 
 void arch_ap_hook(unsigned slot) {
-    (void)slot;
+    extern char exception_vector_table[];
+    extern char ap_exception_stacks[];
+    if (slot < 32) {
+        set_exception_sp((uint64_t)(uintptr_t)&ap_exception_stacks[(slot + 1) * 4096]);
+    }
+    if (current_el() == 2) {
+        WRITE_SYSREG(vbar_el2, (uint64_t)(uintptr_t)exception_vector_table);
+    } else {
+        WRITE_SYSREG(vbar_el1, (uint64_t)(uintptr_t)exception_vector_table);
+    }
+    asm volatile ("isb" ::: "memory");
 }
 
 void arch_check_ap(int base_rev, unsigned slot, struct limine_mp_info *info) {
@@ -303,10 +347,330 @@ void arch_check_ap(int base_rev, unsigned slot, struct limine_mp_info *info) {
           (bsp_state[ST_CURRENTEL] >> 2) & 3);
 }
 
+volatile uint64_t aarch64_sync_trap_count = 0;
+volatile uint64_t aarch64_last_esr = 0;
+volatile uint64_t aarch64_last_far = 0;
+volatile int aarch64_probe_active = 0;
+volatile int aarch64_probe_faulted = 0;
+
+void aarch64_handle_sync(void) {
+    uint64_t esr, far, elr;
+    if (current_el() == 2) {
+        esr = READ_SYSREG(esr_el2);
+        far = READ_SYSREG(far_el2);
+        elr = READ_SYSREG(elr_el2);
+    } else {
+        esr = READ_SYSREG(esr_el1);
+        far = READ_SYSREG(far_el1);
+        elr = READ_SYSREG(elr_el1);
+    }
+
+    aarch64_sync_trap_count++;
+    aarch64_last_esr = esr;
+    aarch64_last_far = far;
+
+    if (aarch64_probe_active) {
+        aarch64_probe_faulted = 1;
+        if (current_el() == 2) {
+            WRITE_SYSREG(elr_el2, elr + 4);
+        } else {
+            WRITE_SYSREG(elr_el1, elr + 4);
+        }
+        return;
+    }
+
+    kprintf("FATAL: Unhandled sync exception ESR=%lx FAR=%lx ELR=%lx (EC=0x%x)\n",
+            esr, far, elr, (unsigned)(esr >> 26));
+    halt();
+}
+
+static bool probe_write8(volatile uint8_t *addr, uint8_t val) {
+    aarch64_probe_faulted = 0;
+    aarch64_probe_active = 1;
+    asm volatile (
+        "dsb ish\n\t"
+        "strb %w1, [%0]\n\t"
+        "dsb ish\n\t"
+        "isb"
+        :: "r" (addr), "r" (val)
+        : "memory"
+    );
+    aarch64_probe_active = 0;
+    return aarch64_probe_faulted == 0;
+}
+
+static bool probe_read8(volatile uint8_t *addr, uint8_t *out_val) {
+    uint8_t val = 0;
+    aarch64_probe_faulted = 0;
+    aarch64_probe_active = 1;
+    asm volatile (
+        "dsb ish\n\t"
+        "ldrb %w0, [%1]\n\t"
+        "dsb ish\n\t"
+        "isb"
+        : "=r" (val)
+        : "r" (addr)
+        : "memory"
+    );
+    aarch64_probe_active = 0;
+    if (aarch64_probe_faulted == 0) {
+        if (out_val != NULL) {
+            *out_val = val;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool probe_read32(volatile uint32_t *addr, uint32_t *out_val) {
+    uint32_t val = 0;
+    aarch64_probe_faulted = 0;
+    aarch64_probe_active = 1;
+    asm volatile (
+        "dsb ish\n\t"
+        "ldr %w0, [%1]\n\t"
+        "dsb ish\n\t"
+        "isb"
+        : "=r" (val)
+        : "r" (addr)
+        : "memory"
+    );
+    aarch64_probe_active = 0;
+    if (aarch64_probe_faulted == 0) {
+        if (out_val != NULL) {
+            *out_val = val;
+        }
+        return true;
+    }
+    return false;
+}
+
+__attribute__((section(".text.probe_target"), aligned(4)))
+static const uint8_t probe_text_target[4] = { 0x1f, 0x20, 0x03, 0xd5 };
+
+__attribute__((section(".data"), aligned(4)))
+static volatile uint8_t probe_data_target = 0x5a;
+
 void arch_check_late(int base_rev, uint64_t rsdp) {
     (void)base_rev;
     (void)rsdp;
     fact("aarch64.mpidr", "%lx", READ_SYSREG(mpidr_el1) & 0xff00ffffff);
+
+    // 1. Timer / CNTVCT trap verification
+    uint64_t traps_before = aarch64_sync_trap_count;
+    uint64_t c1 = READ_SYSREG(cntvct_el0);
+    for (int i = 0; i < 100; i++) {
+        asm volatile ("isb" ::: "memory");
+        (void)READ_SYSREG(cntvct_el0);
+    }
+    uint64_t c2 = READ_SYSREG(cntvct_el0);
+    uint64_t cntvct_traps = aarch64_sync_trap_count - traps_before;
+    fact("aarch64.cntvct_traps", "%lu", cntvct_traps);
+    fact("aarch64.cntvct_advances", "%d", c2 >= c1);
+    fact("aarch64.cntfrq", "%lu", READ_SYSREG(cntfrq_el0));
+    check(cntvct_traps == 0, "aarch64.cntvct_no_traps", "cntvct produced %lu traps", cntvct_traps);
+
+    // 2. SBSA Watchdog check
+    volatile uint32_t *wcs = (volatile uint32_t *)0x0f001000;
+    uint32_t wcs_val = 0;
+    if (probe_read32(wcs, &wcs_val)) {
+        fact("aarch64.sbsa_gwdt.present", "%d", 1);
+        fact("aarch64.sbsa_gwdt.enabled", "%d", (wcs_val & 1) != 0);
+        fact("aarch64.sbsa_gwdt.wcs", "%x", wcs_val);
+        check((wcs_val & 1) == 0, "aarch64.sbsa_gwdt.disabled", "WCS=%x", wcs_val);
+    } else {
+        fact("aarch64.sbsa_gwdt.present", "%d", 0);
+    }
+
+    // 3. W^X selftest (data writable/NX, code RO/executable, claimed UEFI memory RWX)
+    bool data_writable = probe_write8(&probe_data_target, 0xa5);
+    bool data_read_ok = (probe_data_target == 0xa5);
+    fact("aarch64.wx.data_writable", "%d", data_writable && data_read_ok);
+
+    bool code_write_succeeded = probe_write8((volatile uint8_t *)probe_text_target, 0x00);
+    uint32_t fault_ec = (uint32_t)(aarch64_last_esr >> 26);
+    bool code_ro_enforced = (!code_write_succeeded) && (fault_ec == 0x25);
+    fact("aarch64.wx.code_ro", "%d", code_ro_enforced);
+
+    // Verify UEFI claimed memory (EfiLoaderCode) and high RAM are writable and executable without fault
+    bool usable_writable = false;
+    bool high_ram_writable = false;
+    bool has_high_ram = false;
+    static struct pt_walk w_usable, w_high;
+    bool walk_usable_ok = false, walk_high_ok = false;
+
+    if (have_hhdm && memmap != NULL) {
+        for (uint64_t i = 0; i < memmap->entry_count; i++) {
+            struct limine_memmap_entry *e = memmap->entries[i];
+            if (e->type != LIMINE_MEMMAP_USABLE || e->length < 4096) {
+                continue;
+            }
+            if (!usable_writable) {
+                uint64_t u_va = hhdm_offset + e->base;
+                uint8_t orig = 0;
+                if (probe_read8((volatile uint8_t *)(uintptr_t)u_va, &orig)) {
+                    bool w_ok = probe_write8((volatile uint8_t *)(uintptr_t)u_va, 0xa5);
+                    uint8_t readback = 0;
+                    bool r_ok = probe_read8((volatile uint8_t *)(uintptr_t)u_va, &readback) && (readback == 0xa5);
+                    if (w_ok) {
+                        probe_write8((volatile uint8_t *)(uintptr_t)u_va, orig);
+                    }
+                    if (w_ok && r_ok) {
+                        usable_writable = true;
+                        walk_usable_ok = arch_walk(u_va, &w_usable);
+                    }
+                }
+            }
+            uint64_t top = e->base + e->length;
+            if (top > (1ULL << 32) && !high_ram_writable) {
+                has_high_ram = true;
+                uint64_t high_base = e->base >= (1ULL << 32) ? e->base : (1ULL << 32);
+                uint64_t h_va = hhdm_offset + high_base;
+                uint8_t orig = 0;
+                if (probe_read8((volatile uint8_t *)(uintptr_t)h_va, &orig)) {
+                    bool w_ok = probe_write8((volatile uint8_t *)(uintptr_t)h_va, 0x5a);
+                    uint8_t readback = 0;
+                    bool r_ok = probe_read8((volatile uint8_t *)(uintptr_t)h_va, &readback) && (readback == 0x5a);
+                    if (w_ok) {
+                        probe_write8((volatile uint8_t *)(uintptr_t)h_va, orig);
+                    }
+                    if (w_ok && r_ok) {
+                        high_ram_writable = true;
+                        walk_high_ok = arch_walk(h_va, &w_high);
+                    }
+                }
+            }
+        }
+    }
+
+    fact("aarch64.wx.usable_writable", "%d", usable_writable);
+    fact("aarch64.wx.usable_executable", "%d", walk_usable_ok && w_usable.executable);
+    if (has_high_ram) {
+        fact("aarch64.wx.high_ram_writable", "%d", high_ram_writable);
+    }
+
+    bool pt_ok = true;
+    if (have_hhdm) {
+        static struct pt_walk w_data, w_code;
+        bool walk_data_ok = arch_walk((uint64_t)(uintptr_t)&probe_data_target, &w_data);
+        bool walk_code_ok = arch_walk((uint64_t)(uintptr_t)probe_text_target, &w_code);
+        pt_ok = walk_data_ok && walk_code_ok && w_data.writable && !w_data.executable
+                && !w_code.writable && w_code.executable;
+        if (usable_writable) {
+            pt_ok = pt_ok && walk_usable_ok && w_usable.writable && w_usable.executable;
+        }
+        if (has_high_ram) {
+            pt_ok = pt_ok && walk_high_ok && w_high.writable;
+        }
+    }
+    fact("aarch64.wx.pt_enforced", "%d", pt_ok);
+
+    bool wx_ok = data_writable && data_read_ok && code_ro_enforced && pt_ok;
+    if (have_hhdm && memmap != NULL) {
+        wx_ok = wx_ok && usable_writable;
+    }
+    if (has_high_ram) {
+        wx_ok = wx_ok && high_ram_writable;
+    }
+    fact("aarch64.wx_selftest", "%s", wx_ok ? "ok" : "fail");
+    check(wx_ok, "aarch64.wx_enforced", "W^X enforced: data/usable writable, code RO (fault EC=0x%x)", fault_ec);
+
+    // 4. PCIe ECAM scan for NVMe storage controller
+    uint64_t ecam_base = 0;
+    if (have_hhdm && rsdp != 0) {
+        const uint8_t *rsdp_ptr = (const uint8_t *)(uintptr_t)(hhdm_offset + rsdp);
+        bool xsdt = rsdp_ptr[15] >= 2;
+        uint64_t root_phys = 0;
+        if (xsdt) {
+            memcpy(&root_phys, rsdp_ptr + 24, 8);
+        }
+        else {
+            uint32_t r32 = 0;
+            memcpy(&r32, rsdp_ptr + 16, 4);
+            root_phys = r32;
+        }
+        if (root_phys != 0) {
+            const uint8_t *root = (const uint8_t *)(uintptr_t)(hhdm_offset + root_phys);
+            uint32_t root_len = 0;
+            memcpy(&root_len, root + 4, 4);
+            size_t esize = xsdt ? 8 : 4;
+            for (size_t off = 36; off + esize <= root_len; off += esize) {
+                uint64_t tbl_phys = 0;
+                if (xsdt) {
+                    memcpy(&tbl_phys, root + off, 8);
+                }
+                else {
+                    uint32_t t32 = 0;
+                    memcpy(&t32, root + off, 4);
+                    tbl_phys = t32;
+                }
+                if (tbl_phys == 0) {
+                    continue;
+                }
+                const uint8_t *tbl = (const uint8_t *)(uintptr_t)(hhdm_offset + tbl_phys);
+                if (memcmp(tbl, "MCFG", 4) == 0) {
+                    memcpy(&ecam_base, tbl + 44, 8);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (ecam_base == 0) {
+        uint32_t test_val = 0;
+        if (probe_read32((volatile uint32_t *)(uintptr_t)0x4010000000ULL, &test_val)) {
+            ecam_base = 0x4010000000ULL;
+        }
+        else {
+            ecam_base = 0x3f000000ULL;
+        }
+    }
+
+    bool nvme_found = false;
+    uint16_t nvme_vendor = 0;
+    uint16_t nvme_device = 0;
+    uint32_t nvme_class = 0;
+    uint8_t nvme_slot = 0;
+
+    for (uint8_t dev = 0; dev < 32; dev++) {
+        volatile uint32_t *pci_cfg = (volatile uint32_t *)(uintptr_t)(ecam_base + ((uint64_t)dev << 15));
+        uint32_t id_reg = 0;
+        if (!probe_read32(pci_cfg, &id_reg) || id_reg == 0xffffffff || id_reg == 0) {
+            continue;
+        }
+        uint16_t vendor = (uint16_t)(id_reg & 0xffff);
+        uint16_t device = (uint16_t)(id_reg >> 16);
+
+        uint32_t class_reg = 0;
+        if (!probe_read32(pci_cfg + 2, &class_reg)) {
+            continue;
+        }
+        uint32_t class_code = class_reg >> 8;
+        uint8_t base_class = (uint8_t)(class_code >> 16);
+        uint8_t sub_class = (uint8_t)(class_code >> 8);
+
+        // Mass storage (0x01) and Non-Volatile Memory (0x08)
+        if (base_class == 0x01 && sub_class == 0x08) {
+            nvme_found = true;
+            nvme_vendor = vendor;
+            nvme_device = device;
+            nvme_class = class_code;
+            nvme_slot = dev;
+            break;
+        }
+    }
+
+    if (nvme_found) {
+        fact("aarch64.pci.nvme.present", "%d", 1);
+        fact("aarch64.pci.nvme.vendor_id", "%04x", nvme_vendor);
+        fact("aarch64.pci.nvme.device_id", "%04x", nvme_device);
+        fact("aarch64.pci.nvme.class", "%06x", nvme_class);
+        fact("aarch64.pci.nvme.slot", "%u", nvme_slot);
+        fact("boot.device", "nvme");
+        fact("boot_device", "nvme");
+    } else {
+        fact("aarch64.pci.nvme.present", "%d", 0);
+    }
 }
 
 void arch_dtb(const void *dtb) {

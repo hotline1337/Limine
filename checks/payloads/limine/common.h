@@ -35,5 +35,7 @@ __attribute__((noreturn)) void halt(void);
 
 extern uint64_t hhdm_offset;
 extern bool have_hhdm;
+struct limine_memmap_response;
+extern struct limine_memmap_response *memmap;
 
 #endif

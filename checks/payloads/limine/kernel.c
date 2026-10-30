@@ -293,7 +293,7 @@ static void report_symbols(void) {
 uint64_t hhdm_offset;
 bool have_hhdm;
 static int base_rev;
-static struct limine_memmap_response *memmap;
+struct limine_memmap_response *memmap;
 
 void out_char(char c) {
     arch_out_char(c);
