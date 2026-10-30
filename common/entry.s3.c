@@ -36,12 +36,12 @@ noreturn void uefi_entry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) 
     gRT = SystemTable->RuntimeServices;
     efi_image_handle = ImageHandle;
 
+    EFI_STATUS watchdog_status = gBS->SetWatchdogTimer(0, 0x10000, 0, NULL);
+
     reseed_stack_guard();
 
     calibrate_tsc();
     usec_at_bootloader_entry = rdtsc_usec();
-
-    EFI_STATUS status;
 
     gST->ConOut->EnableCursor(gST->ConOut, false);
 
@@ -49,8 +49,7 @@ noreturn void uefi_entry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) 
 
     term_fallback();
 
-    status = gBS->SetWatchdogTimer(0, 0x10000, 0, NULL);
-    if (status) {
+    if (watchdog_status) {
         print("WARNING: Failed to disable watchdog timer!\n");
     }
 
@@ -146,8 +145,8 @@ opened:
         EFI_GUID loaded_img_prot_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
         EFI_LOADED_IMAGE_PROTOCOL *loaded_image = NULL;
 
-        status = gBS->HandleProtocol(current_handle, &loaded_img_prot_guid,
-                                     (void **)&loaded_image);
+        EFI_STATUS status = gBS->HandleProtocol(current_handle, &loaded_img_prot_guid,
+                                                (void **)&loaded_image);
 
         if (status) {
             goto could_not_match;
