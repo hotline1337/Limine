@@ -867,6 +867,10 @@ static void connect_storage_controllers(bool bound) {
         return;
     }
     for (EFI_UINTN i = 0; i < all_handles_count; i++) {
+        if (is_efi_handle_to_skip(all_handles[i])) {
+            continue;
+        }
+
         if (should_connect_storage_controller(all_handles[i], bound)) {
             gBS->ConnectController(all_handles[i], NULL, NULL, true);
         }
@@ -1042,7 +1046,9 @@ static bool index_disks(void) {
 }
 
 void disk_create_index(void) {
+#if defined(__x86_64__) || defined(__i386__)
     connect_storage_controllers(false);
+#endif
 
     EFI_GUID block_io_guid = EFI_BLOCK_IO_PROTOCOL_GUID;
     EFI_HANDLE handle;
@@ -1056,6 +1062,10 @@ void disk_create_index(void) {
         status = gBS->LocateHandle(EfiByProtocol, &pxe_guid, NULL, &handles_size, &handle);
         // likewise, all that matters is that the protocol is present
         if (status == EFI_BUFFER_TOO_SMALL || status == EFI_SUCCESS) {
+            return;
+        }
+
+        if (disk_connect_all()) {
             return;
         }
 
