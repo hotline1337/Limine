@@ -139,6 +139,7 @@ def main(argv=None):
     ap.add_argument('--coverage', action='store_true',
                     help='record executed Limine code and report line coverage')
     args = ap.parse_args(argv)
+    args.port = [p for item in args.port for p in item.split(',') if p]
 
     env = Env(args.builddir, args.outdir, args.ovmfdir)
     checks = load_cases()
