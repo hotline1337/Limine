@@ -257,7 +257,12 @@ void *get_device_tree_blob(const char *config, size_t extra_size,
     size_t size = 0;
     void *dtb = NULL;
 
-    {
+    bool allow_external_dtb = true;
+#if defined(UEFI)
+    allow_external_dtb = !firmware_secure_boot;
+#endif
+
+    if (allow_external_dtb) {
         char *dtb_path = NULL;
         bool soft_panic;
         if (config != NULL) {
