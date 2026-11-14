@@ -66,6 +66,9 @@ noreturn void uefi_entry(efi_handle image_handle, struct efi_system_table *syste
 
     efi_init_secure_boot();
     tpm_init();
+    if (firmware_secure_boot) {
+        tpm_enable_secure_boot();
+    }
 
     boot_volume = NULL;
 
